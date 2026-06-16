@@ -41,7 +41,26 @@ extern void     vmm_map(uint32_t* pd, uint32_t va, uint32_t pa, int flags);
 extern void     irq_spinlock_init   (irq_spinlock_t* lock);
 extern void     irq_spinlock_acquire(irq_spinlock_t* lock);
 extern void     irq_spinlock_release(irq_spinlock_t* lock);
-extern void     irq_register_handler(unsigned int irq, void (*handler)(void));
+
+/* MSI-X table entry struct (must match kernel's msi.h) */
+struct msix_table_entry {
+    uint32_t msg_addr_lo;
+    uint32_t msg_addr_hi;
+    uint32_t msg_data;
+    uint32_t vector_ctrl;
+} __attribute__((packed));
+
+extern int      msix_alloc_vector(void);
+extern void     msix_free_vector(int vec);
+extern int      msix_register_handler(int vec, void (*handler)(void));
+extern void     msix_unregister_handler(int vec);
+extern int      pci_msix_support(pci_device_t *dev);
+extern int      pci_msix_table_map(pci_device_t *dev,
+                                   volatile struct msix_table_entry **table_out,
+                                   uint32_t *table_size_out);
+extern int      pci_msix_enable(pci_device_t *dev, int vec,
+                                volatile struct msix_table_entry *table,
+                                unsigned int entry_idx);
 extern void     mutex_init  (mutex_t* m);
 extern void     mutex_lock  (mutex_t* m);
 extern void     mutex_unlock(mutex_t* m);
@@ -91,8 +110,8 @@ static int               ahci_ready;
 static int               ahci_attached;
 static int               devfs_was_registered;
 
-static uint8_t           ahci_irq_line;
-static int               ahci_irq_armed;
+static int               ahci_msix_vector;
+static volatile struct msix_table_entry *ahci_msix_table;
 static uint32_t          saved_pci_cmd_dw;
 static uint8_t           ahci_bus, ahci_dev, ahci_fn;
 
@@ -106,24 +125,7 @@ static hba_cmd_header_t *cmd_headers[AHCI_MAX_PORTS];
 static hba_cmd_tbl_t    *cmd_tables [AHCI_MAX_PORTS];
 static uint8_t          *fis_bufs   [AHCI_MAX_PORTS];
 
-/* ── PIC mask helpers (8259A) ──────────────────────────────────── */
-static void pic_mask_line(unsigned irq) {
-    if (irq >= 16) return;
-    uint16_t port = irq < 8 ? 0x21u : 0xA1u;
-    uint8_t  line = irq < 8 ? (uint8_t)irq : (uint8_t)(irq - 8);
-    uint8_t  m    = port_byte_in(port);
-    m |= (uint8_t)(1u << line);
-    port_byte_out(port, m);
-}
 
-static void pic_unmask_line(unsigned irq) {
-    if (irq >= 16) return;
-    uint16_t port = irq < 8 ? 0x21u : 0xA1u;
-    uint8_t  line = irq < 8 ? (uint8_t)irq : (uint8_t)(irq - 8);
-    uint8_t  m    = port_byte_in(port);
-    m &= (uint8_t)~(1u << line);
-    port_byte_out(port, m);
-}
 
 /* ~10 us busy-wait with PAUSE hint */
 static void ahci_udelay(uint32_t us) {
@@ -578,10 +580,11 @@ static void ahci_detach(void) {
         abar->is = (uint32_t)-1;
     }
 
-    if (ahci_irq_armed && ahci_irq_line < 16) {
-        pic_mask_line(ahci_irq_line);
-        irq_register_handler(ahci_irq_line, NULL);
-        ahci_irq_armed = 0;
+    if (ahci_msix_vector >= 0) {
+        msix_unregister_handler(ahci_msix_vector);
+        msix_free_vector(ahci_msix_vector);
+        ahci_msix_vector = -1;
+        ahci_msix_table  = NULL;
     }
 
     /* Restore PCI command register if we changed it */
@@ -657,17 +660,26 @@ int pci_driver_probe(pci_device_t *pdev) {
     cmd &= ~(1u << 10);       /* clear INTx Disable */
     pci_write32(pdev->bus, pdev->dev, pdev->fn, 0x04, cmd);
 
-    /* Wire ISR BEFORE enabling controller IE so a fast device can't fire
-     * an IRQ into a NULL handler. */
-    ahci_irq_line = pdev->irq_line;
-    if (ahci_irq_line < 16) {
-        irq_register_handler(ahci_irq_line, ahci_isr);
-        pic_unmask_line(ahci_irq_line);
-        ahci_irq_armed = 1;
-    } else {
-        klog(KLOG_FAIL, "AHCI (kmod): no valid PCI IRQ line — refusing");
-        ahci_detach();
-        return -1;
+    /* Wire ISR via MSI-X before enabling controller IE */
+    {
+        volatile struct msix_table_entry *table = NULL;
+        uint32_t table_size = 0;
+        ahci_msix_vector = -1;
+        ahci_msix_table  = NULL;
+        int cap = pci_msix_support(pdev);
+        if (cap && pci_msix_table_map(pdev, &table, &table_size) == 0 && table_size > 0) {
+            int vec = msix_alloc_vector();
+            if (vec > 0) {
+                msix_register_handler(vec, ahci_isr);
+                pci_msix_enable(pdev, vec, table, 0);
+                ahci_msix_vector = vec;
+                ahci_msix_table  = table;
+                klog(KLOG_OK, "AHCI: MSI-X enabled");
+            }
+        }
+        if (ahci_msix_vector < 0) {
+            klog(KLOG_WARN, "AHCI: MSI-X unavailable — using poll mode (slow)");
+        }
     }
 
     if (ahci_init_controller(mmio) < 0) {
@@ -707,7 +719,7 @@ int pci_driver_probe(pci_device_t *pdev) {
         char tmp[16]; itoa(port, tmp);
         kprint("[AHCI] active SATA port="); kprint(tmp);
         kprint(" model="); kprint(ports_info[port].model);
-        kprint("  IRQ="); kprint_hex(ahci_irq_line); kprint("\n");
+        kprint(" IRQ=MSI-X\n");
     }
 
     ahci_attached = 1;            /* set BEFORE devfs so detach restores PCI cmd */
